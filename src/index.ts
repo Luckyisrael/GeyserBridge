@@ -9,7 +9,10 @@ import { ConnectionPool } from './solana/pool';
 import { SubscriptionManager } from './subscriptions/manager';
 import { GeyserService } from './services/geyser';
 import { SolanaBridge } from './bridge/solana-bridge';
+import { MetricsServer } from './metrics/server';
 import { SlotStatus, statusFromCommitment } from './translate/slot';
+import { ApiKeyStore } from './auth/store';
+import { requireAuth, requireAuthStream } from './auth/interceptor';
 
 const PROTO_PATH = path.resolve(__dirname, '..', 'proto', 'geyser.proto');
 const PROTO_DIR = path.resolve(__dirname, '..', 'proto');
@@ -19,7 +22,13 @@ async function bootstrap(): Promise<void> {
   initLogger(config);
   const log = getLogger();
 
+  if (!config.adminKey || config.adminKey === 'change-me-to-a-random-secret') {
+    log.fatal('ADMIN_KEY must be set to a secure random value');
+    process.exit(1);
+  }
   log.info({ version: config.version, solanaRpc: config.solanaRpcUrl }, 'GeyserBridge starting');
+
+  const apiKeyStore = new ApiKeyStore(config.adminKey);
 
   const pool = new ConnectionPool(
     config.solanaRpcUrl,
@@ -34,7 +43,9 @@ async function bootstrap(): Promise<void> {
     (u) => u.slot,
   );
 
-  const geyserService = new GeyserService(pool, subManager, slotBuffer, config);
+  const metricsServer = new MetricsServer(config, pool);
+  const geyserService = new GeyserService(pool, subManager, slotBuffer, config, metricsServer.reporter);
+  metricsServer.setGeyserService(geyserService);
   const solanaBridge = new SolanaBridge(pool, subManager, config);
 
   // Connect bridge events => geyser service fan-out
@@ -56,19 +67,20 @@ async function bootstrap(): Promise<void> {
   });
 
   server.addService(proto.geyser.Geyser.service, {
-    Subscribe: geyserService.subscribe.bind(geyserService),
-    SubscribeDeshred: (_call: any, callback: any) => {
-      callback({ code: grpc.status.UNIMPLEMENTED, message: 'Not implemented' });
-    },
-    SubscribeReplayInfo: (_call: any, callback: any) => {
+    Subscribe: requireAuthStream(apiKeyStore, geyserService.subscribe.bind(geyserService)),
+    SubscribeDeshred: requireAuthStream(apiKeyStore, (_call: any) => {
+      _call.emit('error', { code: grpc.status.UNIMPLEMENTED, message: 'Not implemented' });
+      _call.destroy();
+    }),
+    SubscribeReplayInfo: requireAuth(apiKeyStore, (_call: any, callback: any) => {
       callback(null, { first_available: slotBuffer.oldestKey() ?? null });
-    },
+    }),
     Ping: geyserService.ping.bind(geyserService),
-    GetSlot: geyserService.getSlot.bind(geyserService),
-    GetBlockHeight: geyserService.getBlockHeight.bind(geyserService),
-    GetLatestBlockhash: geyserService.getLatestBlockhash.bind(geyserService),
-    IsBlockhashValid: geyserService.isBlockhashValid.bind(geyserService),
-    GetVersion: geyserService.getVersion.bind(geyserService),
+    GetSlot: requireAuth(apiKeyStore, geyserService.getSlot.bind(geyserService)),
+    GetBlockHeight: requireAuth(apiKeyStore, geyserService.getBlockHeight.bind(geyserService)),
+    GetLatestBlockhash: requireAuth(apiKeyStore, geyserService.getLatestBlockhash.bind(geyserService)),
+    IsBlockhashValid: requireAuth(apiKeyStore, geyserService.isBlockhashValid.bind(geyserService)),
+    GetVersion: requireAuth(apiKeyStore, geyserService.getVersion.bind(geyserService)),
   });
 
   const credentials = config.tlsCertPath && config.tlsKeyPath
@@ -91,6 +103,7 @@ async function bootstrap(): Promise<void> {
 
   geyserService.start();
   solanaBridge.start();
+  metricsServer.start();
 
   const primaryConn = pool.acquire();
   const conn = primaryConn.connection;
@@ -106,8 +119,8 @@ async function bootstrap(): Promise<void> {
 
   pool.release(primaryConn.id);
 
-  process.on('SIGINT', () => shutdown(server, geyserService, solanaBridge, log));
-  process.on('SIGTERM', () => shutdown(server, geyserService, solanaBridge, log));
+  process.on('SIGINT', () => shutdown(server, geyserService, solanaBridge, metricsServer, log));
+  process.on('SIGTERM', () => shutdown(server, geyserService, solanaBridge, metricsServer, log));
 
   log.info('GeyserBridge ready');
 }
@@ -116,11 +129,13 @@ function shutdown(
   server: grpc.Server,
   geyserService: GeyserService,
   solanaBridge: SolanaBridge,
+  metricsServer: MetricsServer,
   log: any,
 ): void {
   log.info('Shutting down');
   geyserService.stop();
   solanaBridge.stop();
+  metricsServer.stop();
   const timeout = setTimeout(() => process.exit(1), 10000).unref();
   server.tryShutdown(() => {
     clearTimeout(timeout);

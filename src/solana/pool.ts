@@ -78,13 +78,6 @@ export class ConnectionPool extends EventEmitter {
     }
   }
 
-  async reconnectAll(): Promise<void> {
-    for (const entry of this.connections) {
-      entry.healthy = true;
-      entry.subscriptionCount = 0;
-    }
-  }
-
   getConnection(id: number): PoolConnection | undefined {
     return this.connections.find((c) => c.id === id);
   }

@@ -1,17 +1,18 @@
 import { EventEmitter } from 'events';
-import { sendUnaryData, ServerUnaryCall } from '@grpc/grpc-js';
+import { sendUnaryData, ServerUnaryCall, status } from '@grpc/grpc-js';
 import { Connection } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { ConnectionPool } from '../solana/pool';
-import { SubscriptionManager, SubscriberFilters, SubscriberState } from '../subscriptions/manager';
+import { SubscriptionManager, SubscriberFilters } from '../subscriptions/manager';
 import { RingBuffer } from '../utils/ring-buffer';
 import { getLogger } from '../utils/logger';
 import { Config } from '../config';
+import { MetricsReporter } from '../metrics/server';
 import { CommitmentLevel, commitmentFromOptional, commitmentToSolana } from '../translate/commitment';
 import { SlotStatus, statusFromCommitment } from '../translate/slot';
 import { AccountUpdate } from '../translate/account';
-import { TransactionUpdate } from '../translate/transaction';
-import { BlockUpdate, makeBlockMeta } from '../translate/block';
+import { TransactionUpdate, makeTransactionUpdate } from '../translate/transaction';
+import { makeBlockMeta } from '../translate/block';
 import { SolanaBridge, StreamWriter } from '../bridge/solana-bridge';
 
 interface SlotUpdate {
@@ -28,13 +29,16 @@ export class GeyserService extends EventEmitter {
   private running = false;
   private pingTimers: Map<string, NodeJS.Timeout> = new Map();
   private streams: Map<string, StreamWriter> = new Map();
+  private pendingBlockFetches: Map<number, Promise<any>> = new Map();
+  private metrics: MetricsReporter | null = null;
 
-  constructor(pool: ConnectionPool, subManager: SubscriptionManager, slotBuffer: RingBuffer<SlotUpdate>, config: Config) {
+  constructor(pool: ConnectionPool, subManager: SubscriptionManager, slotBuffer: RingBuffer<SlotUpdate>, config: Config, metrics?: MetricsReporter) {
     super();
     this.pool = pool;
     this.subManager = subManager;
     this.slotBuffer = slotBuffer;
     this.config = config;
+    this.metrics = metrics ?? null;
   }
 
   start(): void {
@@ -48,9 +52,26 @@ export class GeyserService extends EventEmitter {
     for (const t of this.pingTimers.values()) clearInterval(t);
     this.pingTimers.clear();
     this.streams.clear();
+    this.pendingBlockFetches.clear();
   }
 
-  /** Connect to SolanaBridge to fan out data to subscriber streams */
+  /** Fetch a block, deduplicating concurrent requests for the same slot */
+  private async getBlockCached(slot: number): Promise<any> {
+    const existing = this.pendingBlockFetches.get(slot);
+    if (existing) return existing;
+    const entry = this.pool.acquire();
+    const promise = entry.connection.getBlock(slot, {
+      commitment: 'confirmed',
+      maxSupportedTransactionVersion: 0,
+    }).finally(() => this.pool.release(entry.id));
+    this.pendingBlockFetches.set(slot, promise);
+    try {
+      return await promise;
+    } finally {
+      this.pendingBlockFetches.delete(slot);
+    }
+  }
+
   connectBridge(bridge: SolanaBridge): void {
     bridge.on('accountUpdate', (update: AccountUpdate) => this.pushAccountUpdate(update));
     bridge.on('transactionStatus', (status: { slot: number; signature: Buffer; isVote: boolean; index: number; err: Buffer | null }) =>
@@ -59,7 +80,6 @@ export class GeyserService extends EventEmitter {
     bridge.on('transactionUpdate', (update: TransactionUpdate) => this.pushTransactionUpdate(update));
   }
 
-  /** Push an account update to matching subscriber streams */
   pushAccountUpdate(update: AccountUpdate): void {
     for (const [sid, state] of this.subManager.getAllSubscribers()) {
       for (const filter of state.filters.accounts.values()) {
@@ -90,7 +110,6 @@ export class GeyserService extends EventEmitter {
     }
   }
 
-  /** Push a transaction status update to matching subscriber streams */
   pushTransactionStatus(status: { slot: number; signature: Buffer; isVote: boolean; index: number; err: Buffer | null }): void {
     for (const [sid, state] of this.subManager.getAllSubscribers()) {
       const filters = state.filters.transactionsStatus;
@@ -145,7 +164,52 @@ export class GeyserService extends EventEmitter {
     }
   }
 
-  /** Push a full transaction update to matching subscriber streams */
+  private txUpdateToProtoTx(update: TransactionUpdate): any {
+    return {
+      signatures: update.transaction.signatures.map((s) => Buffer.from(s)),
+      message: {
+        header: update.transaction.message.header,
+        accountKeys: update.transaction.message.accountKeys.map((k) => Buffer.from(k)),
+        recentBlockhash: Buffer.from(update.transaction.message.recentBlockhash),
+        instructions: update.transaction.message.instructions.map((ix) => ({
+          programIdIndex: ix.programIdIndex,
+          accounts: Buffer.from(ix.accounts),
+          data: Buffer.from(ix.data),
+        })),
+        versioned: update.transaction.message.versioned,
+        addressTableLookups: update.transaction.message.addressTableLookups.map((l) => ({
+          accountKey: Buffer.from(l.accountKey),
+          writableIndexes: Buffer.from(l.writableIndexes),
+          readonlyIndexes: Buffer.from(l.readonlyIndexes),
+        })),
+      },
+    };
+  }
+
+  private txUpdateToProtoMeta(update: TransactionUpdate): any {
+    return {
+      err: update.meta.err && update.meta.err.length > 0 ? update.meta.err : null,
+      fee: Number(update.meta.fee),
+      preBalances: update.meta.preBalances.map((b) => Number(b)),
+      postBalances: update.meta.postBalances.map((b) => Number(b)),
+      innerInstructions: update.meta.innerInstructions.map((ii) => ({
+        index: ii.index,
+        instructions: ii.instructions.map((inst) => ({
+          programIdIndex: inst.programIdIndex,
+          accounts: Buffer.from(inst.accounts),
+          data: Buffer.from(inst.data),
+          stackHeight: inst.stackHeight ?? null,
+        })),
+      })),
+      logMessages: update.meta.logMessages,
+      preTokenBalances: update.meta.preTokenBalances,
+      postTokenBalances: update.meta.postTokenBalances,
+      loadedWritableAddresses: update.meta.loadedWritableAddresses.map((a) => Buffer.from(a)),
+      loadedReadonlyAddresses: update.meta.loadedReadonlyAddresses.map((a) => Buffer.from(a)),
+      computeUnitsConsumed: update.meta.computeUnitsConsumed ?? null,
+    };
+  }
+
   pushTransactionUpdate(update: TransactionUpdate): void {
     for (const [sid, state] of this.subManager.getAllSubscribers()) {
       for (const filter of state.filters.transactions.values()) {
@@ -156,46 +220,8 @@ export class GeyserService extends EventEmitter {
             transaction: {
               signature: update.signature,
               isVote: update.isVote,
-              transaction: {
-                signatures: update.transaction.signatures.map((s) => Buffer.from(s)),
-                message: {
-                  header: update.transaction.message.header,
-                  accountKeys: update.transaction.message.accountKeys.map((k) => Buffer.from(k)),
-                  recentBlockhash: Buffer.from(update.transaction.message.recentBlockhash),
-                  instructions: update.transaction.message.instructions.map((ix) => ({
-                    programIdIndex: ix.programIdIndex,
-                    accounts: Buffer.from(ix.accounts),
-                    data: Buffer.from(ix.data),
-                  })),
-                  versioned: update.transaction.message.versioned,
-                  addressTableLookups: update.transaction.message.addressTableLookups.map((l) => ({
-                    accountKey: Buffer.from(l.accountKey),
-                    writableIndexes: Buffer.from(l.writableIndexes),
-                    readonlyIndexes: Buffer.from(l.readonlyIndexes),
-                  })),
-                },
-              },
-              meta: {
-                err: update.meta.err && update.meta.err.length > 0 ? update.meta.err : null,
-                fee: Number(update.meta.fee),
-                preBalances: update.meta.preBalances.map((b) => Number(b)),
-                postBalances: update.meta.postBalances.map((b) => Number(b)),
-                innerInstructions: update.meta.innerInstructions.map((ii) => ({
-                  index: ii.index,
-                  instructions: ii.instructions.map((inst) => ({
-                    programIdIndex: inst.programIdIndex,
-                    accounts: Buffer.from(inst.accounts),
-                    data: Buffer.from(inst.data),
-                    stackHeight: inst.stackHeight ?? null,
-                  })),
-                })),
-                logMessages: update.meta.logMessages,
-                preTokenBalances: update.meta.preTokenBalances,
-                postTokenBalances: update.meta.postTokenBalances,
-                loadedWritableAddresses: update.meta.loadedWritableAddresses.map((a) => Buffer.from(a)),
-                loadedReadonlyAddresses: update.meta.loadedReadonlyAddresses.map((a) => Buffer.from(a)),
-                computeUnitsConsumed: update.meta.computeUnitsConsumed ?? null,
-              },
+              transaction: this.txUpdateToProtoTx(update),
+              meta: this.txUpdateToProtoMeta(update),
               slot: Number(update.slot),
             },
             filters: [sid],
@@ -207,7 +233,6 @@ export class GeyserService extends EventEmitter {
     }
   }
 
-  /** Emit slot / block updates to subscriber streams */
   emitSlotUpdate(slot: number, parent: number | null, status: SlotStatus): void {
     this.slotBuffer.push({ slot, parent, status });
     this.emit('slotUpdate', { slot, parent, status });
@@ -229,11 +254,17 @@ export class GeyserService extends EventEmitter {
       }
     }
 
-    // If any subscriber wants blocks_meta, fetch the block
     for (const [sid, state] of this.subManager.getAllSubscribers()) {
       if (state.filters.blocksMeta.size > 0) {
         this.fetchAndPushBlockMeta(slot, sid);
-        break;
+      }
+    }
+
+    for (const [sid, state] of this.subManager.getAllSubscribers()) {
+      if (state.filters.blocks.size > 0) {
+        for (const filter of state.filters.blocks.values()) {
+          this.fetchAndPushBlock(slot, sid, filter);
+        }
       }
     }
   }
@@ -242,12 +273,7 @@ export class GeyserService extends EventEmitter {
     const stream = this.streams.get(sid);
     if (!stream) return;
     try {
-      const entry = this.pool.acquire();
-      const block = await entry.connection.getBlock(slot, {
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0,
-      });
-      this.pool.release(entry.id);
+      const block = await this.getBlockCached(slot);
       if (!block) return;
       const meta = makeBlockMeta(block, slot);
       const msg = {
@@ -264,56 +290,124 @@ export class GeyserService extends EventEmitter {
         filters: [sid],
       };
       try { stream.write(msg); } catch { this.streams.delete(sid); }
-    } catch {
-      // Block not yet available
+    } catch (err: any) {
+      getLogger().debug({ slot, err: err?.message }, 'Block meta fetch failed (may not be available yet)');
+    }
+  }
+
+  private async fetchAndPushBlock(slot: number, sid: string, filter: any): Promise<void> {
+    const stream = this.streams.get(sid);
+    if (!stream) return;
+    try {
+      const block = await this.getBlockCached(slot);
+      if (!block) return;
+      const b = block as any;
+      const txCount = b.transactions?.length ?? 0;
+      const blockMsg: any = {
+        block: {
+          slot: Number(slot),
+          blockhash: b.blockhash,
+          parentSlot: Number(b.parentSlot),
+          parentBlockhash: b.previousBlockhash,
+          blockTime: b.blockTime ?? null,
+          blockHeight: b.blockHeight ?? null,
+          executedTransactionCount: txCount,
+          rewards: b.rewards ?? [],
+          transactions: [],
+          accounts: [],
+          entries: [],
+          updatedAccountCount: 0,
+          entriesCount: 0,
+        },
+        filters: [sid],
+      };
+
+      if (filter.includeTransactions) {
+        blockMsg.block.transactions = (b.transactions || [])
+          .map((tx: any, i: number) => {
+            const sig = tx.transaction.signatures?.[0];
+            if (!sig) return null;
+            const update = makeTransactionUpdate(sig, { ...tx, slot });
+            if (!update) return null;
+            return {
+              signature: update.signature,
+              isVote: update.isVote,
+              transaction: this.txUpdateToProtoTx(update),
+              meta: this.txUpdateToProtoMeta(update),
+              index: Number(i),
+            };
+          })
+          .filter(Boolean);
+      }
+
+      try { stream.write(blockMsg); } catch { this.streams.delete(sid); }
+    } catch (err: any) {
+      getLogger().debug({ slot, err: err?.message }, 'Block fetch failed (may not be available yet)');
     }
   }
 
   getVersion(_call: ServerUnaryCall<any, any>, callback: sendUnaryData<any>): void {
+    this.metrics?.incrementRPCCall('GetVersion');
     callback(null, { version: this.config.version });
+    this.metrics?.incrementRPCSuccess('GetVersion');
   }
 
   getSlot(call: ServerUnaryCall<any, any>, callback: sendUnaryData<any>): void {
+    this.metrics?.incrementRPCCall('GetSlot');
     const commitment = commitmentFromOptional(call.request?.commitment);
-    this.doWithConn((conn) =>
-      conn.getSlot(commitmentToSolana(commitment)).then((s) => callback(null, { slot: Number(s) })),
+    this.unaryWithConn(
+      (conn) => conn.getSlot(commitmentToSolana(commitment)),
+      callback,
+      (s) => ({ slot: Number(s) }),
+      'GetSlot',
     );
   }
 
   getBlockHeight(call: ServerUnaryCall<any, any>, callback: sendUnaryData<any>): void {
+    this.metrics?.incrementRPCCall('GetBlockHeight');
     const commitment = commitmentFromOptional(call.request?.commitment);
-    this.doWithConn((conn) =>
-      conn.getBlockHeight(commitmentToSolana(commitment)).then((h) => callback(null, { blockHeight: Number(h) })),
+    this.unaryWithConn(
+      (conn) => conn.getBlockHeight(commitmentToSolana(commitment)),
+      callback,
+      (h) => ({ blockHeight: Number(h) }),
+      'GetBlockHeight',
     );
   }
 
   getLatestBlockhash(call: ServerUnaryCall<any, any>, callback: sendUnaryData<any>): void {
+    this.metrics?.incrementRPCCall('GetLatestBlockhash');
     const commitment = commitmentFromOptional(call.request?.commitment);
-    this.doWithConn((conn) =>
-      conn.getLatestBlockhashAndContext(commitmentToSolana(commitment)).then((r) =>
-        callback(null, {
-          slot: Number(r.context.slot),
-          blockhash: r.value.blockhash,
-          lastValidBlockHeight: Number(r.value.lastValidBlockHeight),
-        }),
-      ),
+    this.unaryWithConn(
+      (conn) => conn.getLatestBlockhashAndContext(commitmentToSolana(commitment)),
+      callback,
+      (r) => ({
+        slot: Number(r.context.slot),
+        blockhash: r.value.blockhash,
+        lastValidBlockHeight: Number(r.value.lastValidBlockHeight),
+      }),
+      'GetLatestBlockhash',
     );
   }
 
   isBlockhashValid(call: ServerUnaryCall<any, any>, callback: sendUnaryData<any>): void {
+    this.metrics?.incrementRPCCall('IsBlockhashValid');
     const commitment = commitmentFromOptional(call.request?.commitment);
-    this.doWithConn((conn) =>
-      conn.isBlockhashValid(call.request.blockhash, { commitment: commitmentToSolana(commitment) }).then((r) =>
-        callback(null, { slot: Number(r.context.slot), valid: r.value }),
-      ),
+    this.unaryWithConn(
+      (conn) => conn.isBlockhashValid(call.request.blockhash, { commitment: commitmentToSolana(commitment) }),
+      callback,
+      (r) => ({ slot: Number(r.context.slot), valid: r.value }),
+      'IsBlockhashValid',
     );
   }
 
   ping(call: ServerUnaryCall<any, any>, callback: sendUnaryData<any>): void {
+    this.metrics?.incrementRPCCall('Ping');
     callback(null, { count: call.request?.count ?? 0 });
+    this.metrics?.incrementRPCSuccess('Ping');
   }
 
   subscribe(stream: any): void {
+    this.metrics?.streamOpened();
     const clientId = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`;
     let committed: CommitmentLevel = CommitmentLevel.CONFIRMED;
     const filters: SubscriberFilters = {
@@ -421,8 +515,7 @@ export class GeyserService extends EventEmitter {
       }
 
       const sid = `${clientId}_sub`;
-      this.subManager.unregister(sid);
-      this.subManager.register(sid, {
+      this.subManager.updateSubscriber(sid, {
         id: sid,
         filters: {
           accounts: new Map(filters.accounts), slots: new Map(filters.slots),
@@ -433,17 +526,34 @@ export class GeyserService extends EventEmitter {
         fromSlot: req.from_slot ?? undefined,
       });
       this.streams.set(sid, stream);
+
+      if (req.from_slot != null) {
+        const items = this.slotBuffer.getRange(Number(req.from_slot), Number.MAX_SAFE_INTEGER);
+        for (const item of items) {
+          const replayMsg = {
+            slot: {
+              slot: Number(item.slot),
+              parent: item.parent != null ? Number(item.parent) : null,
+              status: Number(item.status),
+            },
+            filters: [sid],
+          };
+          try { stream.write(replayMsg); } catch { break; }
+        }
+      }
     });
 
     stream.on('close', () => {
       this.subManager.unregister(`${clientId}_sub`);
       this.streams.delete(`${clientId}_sub`);
       if (timeout) clearTimeout(timeout);
+      this.metrics?.streamClosed();
     });
     stream.on('error', () => {
       this.subManager.unregister(`${clientId}_sub`);
       this.streams.delete(`${clientId}_sub`);
       if (timeout) clearTimeout(timeout);
+      this.metrics?.streamClosed();
     });
 
     const timer = setInterval(() => {
@@ -455,10 +565,31 @@ export class GeyserService extends EventEmitter {
 
   private doWithConn(fn: (conn: Connection) => Promise<void>): void {
     const entry = this.pool.acquire();
-    fn(entry.connection).catch((err: Error) => {
-      getLogger().error({ err: err.message }, 'RPC call failed');
+    fn(entry.connection).catch(() => {
       this.pool.markUnhealthy(entry.id);
     }).finally(() => this.pool.release(entry.id));
+  }
+
+  /** Shorthand: execute fn(conn) and call callback(err, result) with gRPC error propagation */
+  private unaryWithConn<T>(
+    fn: (conn: Connection) => Promise<T>,
+    callback: sendUnaryData<any>,
+    transform: (result: T) => any,
+    metricMethod?: string,
+  ): void {
+    const entry = this.pool.acquire();
+    fn(entry.connection).then(
+      (result) => {
+        callback(null, transform(result));
+        if (metricMethod) this.metrics?.incrementRPCSuccess(metricMethod);
+      },
+      (err: any) => {
+        getLogger().error({ err: err?.message }, 'Unary RPC failed');
+        this.pool.markUnhealthy(entry.id);
+        if (metricMethod) this.metrics?.incrementRPCFailure(metricMethod);
+        callback({ code: status.INTERNAL, message: err?.message || 'RPC failed' });
+      },
+    ).finally(() => this.pool.release(entry.id));
   }
 
   get subscriberCount(): number { return this.subManager.totalSubscribers; }

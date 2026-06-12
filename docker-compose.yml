@@ -1,13 +1,19 @@
-version: '3.8'
+version: "3.9"
+
 services:
   geyser-bridge:
     build: .
     ports:
       - "10000:10000"
+      - "10001:10001"
+    env_file:
+      - .env
     environment:
-      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
-      - ADMIN_KEY=${ADMIN_KEY}
-      - LOG_LEVEL=${LOG_LEVEL:-info}
-    volumes:
-      - ./data:/app/data
+      - NODE_ENV=production
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:10001/healthz"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

@@ -157,6 +157,49 @@ describe('GeyserService', () => {
     });
   });
 
+  describe('from_slot replay', () => {
+    it('replays buffered slot updates when from_slot is set', () => {
+      // Pre-fill the ring buffer with some slots
+      service.emitSlotUpdate(5, 4, SlotStatus.SLOT_CONFIRMED);
+      service.emitSlotUpdate(10, 9, SlotStatus.SLOT_CONFIRMED);
+      service.emitSlotUpdate(15, 14, SlotStatus.SLOT_CONFIRMED);
+
+      const stream = new FakeStream();
+      service.subscribe(stream);
+
+      // Connect with from_slot=10
+      stream.emit('data', {
+        slots: { all: {} },
+        commitment: 1,
+        from_slot: 10,
+      });
+
+      // Should replay slot >= 10
+      const slotMsgs = stream.written.filter((m: any) => m.slot);
+      expect(slotMsgs.length).toBeGreaterThanOrEqual(2);
+      expect(slotMsgs.some((m: any) => m.slot.slot === 10)).toBe(true);
+      expect(slotMsgs.some((m: any) => m.slot.slot === 15)).toBe(true);
+      expect(slotMsgs.some((m: any) => m.slot.slot === 5)).toBe(false);
+    });
+
+    it('replays nothing when from_slot is beyond buffer', () => {
+      service.emitSlotUpdate(5, 4, SlotStatus.SLOT_CONFIRMED);
+      service.emitSlotUpdate(10, 9, SlotStatus.SLOT_CONFIRMED);
+
+      const stream = new FakeStream();
+      service.subscribe(stream);
+
+      stream.emit('data', {
+        slots: { all: {} },
+        commitment: 1,
+        from_slot: 100,
+      });
+
+      const slotMsgs = stream.written.filter((m: any) => m.slot);
+      expect(slotMsgs.length).toBe(0);
+    });
+  });
+
   describe('emitSlotUpdate', () => {
     it('pushes slot updates to subscriber streams', () => {
       const stream = new FakeStream();

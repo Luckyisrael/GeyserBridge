@@ -53,6 +53,28 @@ describe('SubscriptionManager', () => {
       expect(mgr.totalSubscribers).toBe(0);
       expect(mgr.hasSlotSubscribers()).toBe(false);
     });
+
+    it('updateSubscriber atomically replaces filters', () => {
+      mgr.register('s1', {
+        id: 's1',
+        filters: { accounts: new Map(), slots: new Map([['all', {}]]), transactions: new Map(), transactionsStatus: new Map(), blocks: new Map(), blocksMeta: new Map(), entry: new Map() },
+        commitment: 1,
+      });
+      // Update to account filter
+      mgr.updateSubscriber('s1', {
+        id: 's1',
+        filters: { accounts: new Map([['a1', { accounts: ['11111111111111111111111111111111'] }]]), slots: new Map(), transactions: new Map(), transactionsStatus: new Map(), blocks: new Map(), blocksMeta: new Map(), entry: new Map() },
+        commitment: 1,
+      });
+      expect(mgr.totalSubscribers).toBe(1);
+      // Slot subscriber should be gone
+      expect(mgr.hasSlotSubscribers()).toBe(false);
+      // Account subscriber should work
+      expect(mgr.shouldSendAccount(
+        { pubkey: Buffer.alloc(32), owner: Buffer.alloc(32), lamports: 0, executable: false, rentEpoch: 0, data: Buffer.alloc(0), writeVersion: 0, slot: 0 },
+        { accounts: ['11111111111111111111111111111111'] },
+      )).toBe(true);
+    });
   });
 
   describe('shouldSendAccount', () => {

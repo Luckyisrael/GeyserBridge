@@ -60,7 +60,7 @@ export function makeTransactionUpdate(sig: string, tx: any): TransactionUpdate |
     signature: Buffer.from(bs58.decode(sig)),
     isVote: isVote(tx),
     slot: tx.slot,
-    index: instructions.length,
+    index: 0,
     transaction: {
       signatures: (tx.transaction.signatures || []).map((s: string) => Buffer.from(bs58.decode(s))),
       message: {

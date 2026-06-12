@@ -1,17 +1,21 @@
-FROM node:20-alpine AS builder
+FROM node:22-alpine AS builder
 WORKDIR /app
-COPY package*.json ./
+COPY package.json package-lock.json ./
 RUN npm ci
-COPY . .
-RUN npm run build
+COPY tsconfig.json ./
+COPY proto/ proto/
+COPY src/ src/
+RUN npx tsc
 
-FROM node:20-alpine AS runner
+FROM node:22-alpine AS runner
 WORKDIR /app
-RUN apk add --no-cache ca-certificates
-COPY package*.json ./
-RUN npm ci --omit=dev
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/proto ./proto
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=builder /app/dist/ dist/
+COPY proto/ proto/
+USER appuser
 EXPOSE 10000
+EXPOSE 10001
 ENV NODE_ENV=production
 CMD ["node", "dist/index.js"]

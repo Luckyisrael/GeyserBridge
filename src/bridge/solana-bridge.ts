@@ -1,8 +1,8 @@
 import { EventEmitter } from 'events';
-import { Connection, PublicKey } from '@solana/web3.js';
+import { PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
 import { ConnectionPool } from '../solana/pool';
-import { SubscriptionManager, SubscriberState } from '../subscriptions/manager';
+import { SubscriptionManager } from '../subscriptions/manager';
 import { getLogger } from '../utils/logger';
 import { Config } from '../config';
 import { makeAccountUpdate } from '../translate/account';
@@ -34,6 +34,7 @@ export class SolanaBridge extends EventEmitter {
 
   private accountSubs: Map<string, ManagedAccountSub> = new Map();
   private logsSub: ManagedLogsSub | null = null;
+  private pendingTxFetches: Map<string, Promise<void>> = new Map();
 
   constructor(pool: ConnectionPool, subManager: SubscriptionManager, config: Config) {
     super();
@@ -146,10 +147,11 @@ export class SolanaBridge extends EventEmitter {
           const sig = logInfo.signature;
           const slot = context.slot;
           const err = logInfo.err;
+          const isVote = !!(logInfo.logs && logInfo.logs.some((l: string) => l.includes('Program Vote111111111111111111111111111111111111111')));
           this.emit('transactionStatus', {
             slot: Number(slot),
             signature: Buffer.from(bs58.decode(sig)),
-            isVote: false,
+            isVote,
             index: 0,
             err: err ? Buffer.from(JSON.stringify(err)) : null,
           });
@@ -179,20 +181,24 @@ export class SolanaBridge extends EventEmitter {
   }
 
   private async fetchAndEmitTransaction(sig: string, slot: number): Promise<void> {
+    if (this.pendingTxFetches.has(sig)) return;
+    const entry = this.pool.acquire();
+    const promise = entry.connection.getTransaction(sig, {
+      commitment: 'confirmed',
+      maxSupportedTransactionVersion: 0,
+    }).finally(() => this.pool.release(entry.id));
+    this.pendingTxFetches.set(sig, promise.then(() => {}));
     try {
-      const entry = this.pool.acquire();
-      const tx = await entry.connection.getTransaction(sig, {
-        commitment: 'confirmed',
-        maxSupportedTransactionVersion: 0,
-      });
-      this.pool.release(entry.id);
+      const tx = await promise;
       if (!tx) return;
       const update = makeTransactionUpdate(sig, { ...tx, slot });
       if (update) {
         this.emit('transactionUpdate', update);
       }
-    } catch {
-      // signature too recent or tx not yet available
+    } catch (err: any) {
+      getLogger().debug({ sig, err: err?.message }, 'Transaction fetch failed (may be too recent)');
+    } finally {
+      this.pendingTxFetches.delete(sig);
     }
   }
 

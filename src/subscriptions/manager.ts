@@ -1,12 +1,10 @@
 import { EventEmitter } from 'events';
-import { ServerWritableStream } from '@grpc/grpc-js';
 import bs58 from 'bs58';
 import { PublicKey } from '@solana/web3.js';
 import { CommitmentLevel } from '../translate/commitment';
 import { getLogger } from '../utils/logger';
 import { AccountUpdate } from '../translate/account';
 import { TransactionUpdate } from '../translate/transaction';
-import { BlockUpdate } from '../translate/block';
 
 export interface AccountFilter {
   accounts?: string[];
@@ -87,11 +85,51 @@ export class SubscriptionManager extends EventEmitter {
   unregister(id: string): void {
     this.subscribers.delete(id);
     this.slotSubscriptions.delete(id);
-    for (const [acct] of this.accountSubscriptions) {
-      this.accountSubscriptions.get(acct)?.delete(id);
+    for (const [acct, set] of this.accountSubscriptions) {
+      set.delete(id);
+      if (set.size === 0) this.accountSubscriptions.delete(acct);
     }
-    for (const [prog] of this.programSubscriptions) {
-      this.programSubscriptions.get(prog)?.delete(id);
+    for (const [prog, set] of this.programSubscriptions) {
+      set.delete(id);
+      if (set.size === 0) this.programSubscriptions.delete(prog);
+    }
+  }
+
+  /** Atomically replace a subscriber's state without a remove-then-add window */
+  updateSubscriber(id: string, state: SubscriberState): void {
+    if (!this.subscribers.has(id)) {
+      this.register(id, state);
+      return;
+    }
+    this.slotSubscriptions.delete(id);
+    for (const [, set] of this.accountSubscriptions) {
+      set.delete(id);
+    }
+    for (const [, set] of this.programSubscriptions) {
+      set.delete(id);
+    }
+    // (empty sets accumulate until unregister cleans them; acceptable)
+
+    this.subscribers.set(id, state);
+
+    if (state.filters.slots.size > 0) {
+      this.slotSubscriptions.add(id);
+    }
+    for (const [, filter] of state.filters.accounts) {
+      if (filter.accounts) {
+        for (const acct of filter.accounts) {
+          const set = this.accountSubscriptions.get(acct) ?? new Set();
+          set.add(id);
+          this.accountSubscriptions.set(acct, set);
+        }
+      }
+      if (filter.owners) {
+        for (const owner of filter.owners) {
+          const set = this.programSubscriptions.get(owner) ?? new Set();
+          set.add(id);
+          this.programSubscriptions.set(owner, set);
+        }
+      }
     }
   }
 
