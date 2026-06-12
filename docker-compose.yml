@@ -1,0 +1,13 @@
+version: '3.8'
+services:
+  geyser-bridge:
+    build: .
+    ports:
+      - "10000:10000"
+    environment:
+      - SOLANA_RPC_URL=${SOLANA_RPC_URL:-https://api.mainnet-beta.solana.com}
+      - ADMIN_KEY=${ADMIN_KEY}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
