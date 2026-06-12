@@ -1,6 +1,7 @@
 import { Connection, Commitment } from '@solana/web3.js';
 import { EventEmitter } from 'events';
 import { getLogger } from '../utils/logger';
+import { RateLimiter } from './rate-limiter';
 
 export interface PoolConnection {
   id: number;
@@ -16,6 +17,7 @@ export class ConnectionPool extends EventEmitter {
   private maxPerConn: number;
   private maxConn: number;
   private nextId: number = 0;
+  private rateLimiter: RateLimiter;
 
   constructor(
     rpcUrl: string,
@@ -28,6 +30,12 @@ export class ConnectionPool extends EventEmitter {
     this.wsUrl = wsUrl;
     this.maxPerConn = maxPerConn;
     this.maxConn = maxConn;
+    this.rateLimiter = new RateLimiter(8, 8);
+  }
+
+  async acquireRateLimited(): Promise<PoolConnection> {
+    await this.rateLimiter.acquire();
+    return this.acquire();
   }
 
   private createConnection(): PoolConnection {

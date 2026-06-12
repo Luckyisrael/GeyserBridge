@@ -59,7 +59,7 @@ export class GeyserService extends EventEmitter {
   private async getBlockCached(slot: number): Promise<any> {
     const existing = this.pendingBlockFetches.get(slot);
     if (existing) return existing;
-    const entry = this.pool.acquire();
+      const entry = await this.pool.acquireRateLimited();
     const promise = entry.connection.getBlock(slot, {
       commitment: 'confirmed',
       maxSupportedTransactionVersion: 0,
@@ -563,21 +563,21 @@ export class GeyserService extends EventEmitter {
     stream.on('close', () => { clearInterval(timer); this.pingTimers.delete(clientId); });
   }
 
-  private doWithConn(fn: (conn: Connection) => Promise<void>): void {
-    const entry = this.pool.acquire();
+  private async doWithConn(fn: (conn: Connection) => Promise<void>): Promise<void> {
+    const entry = await this.pool.acquireRateLimited();
     fn(entry.connection).catch(() => {
       this.pool.markUnhealthy(entry.id);
     }).finally(() => this.pool.release(entry.id));
   }
 
   /** Shorthand: execute fn(conn) and call callback(err, result) with gRPC error propagation */
-  private unaryWithConn<T>(
+  private async unaryWithConn<T>(
     fn: (conn: Connection) => Promise<T>,
     callback: sendUnaryData<any>,
     transform: (result: T) => any,
     metricMethod?: string,
-  ): void {
-    const entry = this.pool.acquire();
+  ): Promise<void> {
+    const entry = await this.pool.acquireRateLimited();
     fn(entry.connection).then(
       (result) => {
         callback(null, transform(result));

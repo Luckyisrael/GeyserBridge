@@ -182,7 +182,7 @@ export class SolanaBridge extends EventEmitter {
 
   private async fetchAndEmitTransaction(sig: string, slot: number): Promise<void> {
     if (this.pendingTxFetches.has(sig)) return;
-    const entry = this.pool.acquire();
+    const entry = await this.pool.acquireRateLimited();
     const promise = entry.connection.getTransaction(sig, {
       commitment: 'confirmed',
       maxSupportedTransactionVersion: 0,
