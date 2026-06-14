@@ -13,7 +13,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROTO_PATH = path.resolve(__dirname, '../proto/geyser.proto');
 const HOST = process.env.HOST || 'localhost';
 const PORT = process.env.PORT || '10000';
-const TOKEN = process.env.ADMIN_KEY || 'my-secret';
+const TOKEN = process.env.ADMIN_KEY || 'demo-key';
 
 const packageDef = protoLoader.loadSync(PROTO_PATH, {
   keepCase: false, longs: Number, enums: Number, defaults: false, oneofs: true,
