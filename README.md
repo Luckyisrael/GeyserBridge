@@ -76,17 +76,17 @@ GeyserBridge runs on any $5 VPS (or your laptop) — no Solana validator, no exp
 
 ```bash
 # Clone and configure
-git clone <repo-url> geyser-bridge
+git clone https://github.com/Luckyisrael/GeyserBridge geyser-bridge
 cd geyser-bridge
 cp .env.example .env
 # EDIT .env: set ADMIN_KEY to a secure random string
 
 # Install and run
 npm install
-npm run dev
+ADMIN_KEY=demo-key npm run dev
 ```
 
-The server starts on `0.0.0.0:10000` (configurable via `PORT` and `HOST`).
+The server starts on `0.0.0.0:10000` (configurable via `PORT` and `HOST`). A startup banner shows available endpoints and example commands.
 
 > **Windows users:** If `npm install` emits deprecation warnings about `start()`, these are harmless and from the `@solana/web3.js` dependency.
 
@@ -96,6 +96,36 @@ The server starts on `0.0.0.0:10000` (configurable via `PORT` and `HOST`).
 npm run build
 ADMIN_KEY=your-secret node dist/index.js
 ```
+
+### Quick Demo (2 terminals)
+
+**Terminal 1 — start the server:**
+```bash
+ADMIN_KEY=demo-key npx tsx src/index.ts
+```
+
+**Terminal 2 — run the examples:**
+```bash
+# Unary RPCs (GetVersion, GetSlot, etc.)
+node examples/unary.mjs
+
+# Live slot streaming
+node examples/stream-slots.mjs
+
+# Everything at once (slots + transactions + blocks)
+node examples/subscribe-all.mjs
+```
+
+### Demo Script (dev call / video)
+
+| Step | Terminal | Command | What to say |
+|------|----------|---------|-------------|
+| 1 | T1 | `ADMIN_KEY=demo-key npx tsx src/index.ts` | "Hosted gRPC costs $50-300/mo. This is free." |
+| 2 | T2 | `node examples/unary.mjs` | "All 6 RPCs hit real Solana mainnet instantly." |
+| 3 | T2 | `node examples/stream-slots.mjs` | "~400ms slot updates — same data as Yellowstone." |
+| 4 | T2 | `node examples/subscribe-all.mjs` | "Slots, txs, blocks — one stream, all at once." |
+| 5 | Browser | `http://localhost:10001/metrics` | "Built-in Prometheus endpoint. Ready for Grafana." |
+| 6 | T2 | `grpcurl -proto proto/geyser.proto -H "x-token: demo-key" -d '{}' localhost:10000 geyser.Geyser/GetVersion` | "Auth works. Ping stays open for health checks." |
 
 ---
 
@@ -214,6 +244,26 @@ The test suite covers:
    - onSlotChange from primary connection
    - emitSlotUpdate() → buffer + push to slot subscribers
    - Fan out blocksMeta and blocks subscribers with dedup cache
+```
+
+---
+
+## Example Scripts (ready to run)
+
+Ready-to-run client scripts in `examples/` — connect to your server and see data instantly:
+
+| Script | What it does |
+|--------|-------------|
+| `node examples/unary.mjs` | Exercises all 6 unary RPCs + auth rejection test |
+| `node examples/stream-slots.mjs` | Subscribes to live slot updates (~400ms) |
+| `node examples/subscribe-all.mjs` | Subscribes to slots + transactions + blocks_meta simultaneously |
+
+Each script reads `ADMIN_KEY` from env or defaults to `demo-key`. Run them while the server is up:
+
+```bash
+node examples/unary.mjs
+node examples/stream-slots.mjs
+node examples/subscribe-all.mjs
 ```
 
 ---
@@ -537,7 +587,29 @@ Available metrics:
 | `geyser_pool_connections` | gauge | Total RPC connections in pool |
 | `geyser_pool_load` | gauge | Sum of active subscriptions across all connections |
 
-Point Prometheus at `http://<host>:10001/metrics` and add a Grafana dashboard to visualize. The metrics server is minimal (pure `node:http`, zero dependencies) and starts/stops with the main process.
+### Prometheus + Grafana (optional)
+
+The repo includes ready-to-use configs in `monitoring/`:
+
+```
+monitoring/
+├── prometheus.yml                          # Scrape config
+└── grafana/
+    ├── datasources/datasource.yml          # Auto-provisioned Prometheus datasource
+    └── dashboards/
+        ├── dashboard-provider.yml
+        └── geyser-bridge.json              # Pre-built dashboard (RPC rates, streams, pool)
+```
+
+Run the full stack:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
+```
+
+Then open `http://localhost:3000` (admin/admin) to see the Grafana dashboard with live RPS, stream counts, pool health, and error rates.
+
+The metrics server itself is minimal (pure `node:http`, zero dependencies) and starts/stops with the main process — it's always available even without Prometheus.
 
 ---
 
@@ -550,6 +622,7 @@ Point Prometheus at `http://<host>:10001/metrics` and add a Grafana dashboard to
 - **`include_accounts` / `include_entries` in blocks filter** — Not supported. Full transaction data is pushed when `include_transactions: true`, but per-account-update and entry data require validator-level access.
 - **No `SubscribeDeshred`** — Requires validator shred data not available from RPC `getBlock`.
 - **`accounts_data_slice`** — Not yet supported in the account filter parser.
+- **Public RPC rate limits** — The free `api.mainnet-beta.solana.com` endpoint throttles at ~100 req/min. Use a private RPC (Helius, QuickNode, Triton) for production. GeyserBridge includes a token-bucket rate limiter (8 req/sec) to handle this gracefully.
 
 ---
 
