@@ -122,7 +122,27 @@ async function bootstrap(): Promise<void> {
   process.on('SIGINT', () => shutdown(server, geyserService, solanaBridge, metricsServer, log));
   process.on('SIGTERM', () => shutdown(server, geyserService, solanaBridge, metricsServer, log));
 
-  log.info('GeyserBridge ready');
+  const banner = `
+╔══════════════════════════════════════════════════════════╗
+║                    GeyserBridge v${config.version.padEnd(6)}                  ║
+║  Yellowstone gRPC — no validator needed                 ║
+╠══════════════════════════════════════════════════════════╣
+║  gRPC:     ${(config.host + ':' + config.port).padEnd(43)}║
+║  Metrics:  ${(config.host + ':' + config.metricsPort).padEnd(43)}║
+║  RPC:      ${config.solanaRpcUrl.padEnd(43)}║
+╠══════════════════════════════════════════════════════════╣
+║  Try it:                                                ║
+║                                                         ║
+║  grpcurl -proto proto/geyser.proto                      ║
+║    -H "x-token: $${config.adminKey}"                       ║
+║    -d '{}'                                               ║
+║    ${config.host}:${config.port} geyser.Geyser/GetVersion          ║
+║                                                         ║
+║  node examples/stream-slots.mjs                         ║
+║  node examples/unary.mjs                                ║
+║  curl http://${config.host}:${config.metricsPort}/metrics      ║
+╚══════════════════════════════════════════════════════════╝`;
+  console.log(banner);
 }
 
 function shutdown(
