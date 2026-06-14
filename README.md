@@ -587,29 +587,7 @@ Available metrics:
 | `geyser_pool_connections` | gauge | Total RPC connections in pool |
 | `geyser_pool_load` | gauge | Sum of active subscriptions across all connections |
 
-### Prometheus + Grafana (optional)
-
-The repo includes ready-to-use configs in `monitoring/`:
-
-```
-monitoring/
-├── prometheus.yml                          # Scrape config
-└── grafana/
-    ├── datasources/datasource.yml          # Auto-provisioned Prometheus datasource
-    └── dashboards/
-        ├── dashboard-provider.yml
-        └── geyser-bridge.json              # Pre-built dashboard (RPC rates, streams, pool)
-```
-
-Run the full stack:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.monitoring.yml up -d
-```
-
-Then open `http://localhost:3000` (admin/admin) to see the Grafana dashboard with live RPS, stream counts, pool health, and error rates.
-
-The metrics server itself is minimal (pure `node:http`, zero dependencies) and starts/stops with the main process — it's always available even without Prometheus.
+The metrics server is minimal (pure `node:http`, zero dependencies) and starts/stops with the main process.
 
 ---
 
